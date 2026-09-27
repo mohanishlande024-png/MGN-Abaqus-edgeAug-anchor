@@ -6,6 +6,8 @@ with contour plots (Abaqus truth | MGN prediction | error).
     python scripts/eval_own_unseen.py --ckpt results_aug20/mgn_best.pt
     python scripts/eval_own_unseen.py --contour-loads all        contours at every load, not just the test loads
     python scripts/eval_own_unseen.py --no-contours              numbers and summary plots only (fast)
+    python scripts/eval_own_unseen.py --draws 8                  average 8 random-edge draws (-> unseen_eval_draws8/)
+    python scripts/eval_own_unseen.py --ckpt results_aug20_anchors_redraw/mgn_best.pt     Run B1 (detected automatically)
 
     SI dataset later:
     python scripts/eval_own_unseen.py --train-data data/dataset_si_aug20.pt --ckpt results_si_aug20/mgn_best.pt \
@@ -68,6 +70,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mgn.dataset import Case, _read_name, build_topology, load_dataset   # noqa: E402
 from mgn.augmented_trainer import AugMGN                                  # noqa: E402
+from mgn.anchor_trainer import AnchorMGN                                  # noqa: E402
 
 HOLE_ID = 3                                # NODE_TYPE_TO_ID["hole"]
 R2_FLOOR = -1.0                            # R2 axes stop here; worse values are marked, not plotted to scale
@@ -126,8 +129,9 @@ def load_model(a):
         cases, aug = None, None
 
     if isinstance(ck, dict) and "model_state_dict" in ck:          # multi_geometry_mgn.pt
-        mgn = AugMGN.load(snap)
-        desc = "final model (%d epochs)" % len(ck.get("train_losses", []))
+        mgn = AnchorMGN.load(snap) if "b1" in ck else AugMGN.load(snap)
+        desc = "final model (%d epochs)%s" % (len(ck.get("train_losses", [])),
+                                              ", Run B1 %s" % ck["b1"] if "b1" in ck else "")
         return mgn, desc, train_loads
 
     if cases is None:
@@ -142,9 +146,14 @@ def load_model(a):
 
     print("rebuilding normalisation from %s (%d training cases) ..." % (a.train_data, len(cases)))
     y = np.concatenate([c.von_mises for c in cases])
-    mgn = AugMGN(num_layers=a.layers, hidden_channels=a.hidden, embedding_dim=a.embedding,
-                 learning_rate=1e-5, epochs=1, global_features=["load"],
-                 aug_perc=aug["aug_perc"], aug_seed=aug["aug_seed"])
+    cfg = ck.get("config", {}) if isinstance(ck, dict) else {}
+    kw = dict(num_layers=cfg.get("layers", a.layers), hidden_channels=cfg.get("hidden", a.hidden),
+              embedding_dim=cfg.get("embedding", a.embedding), learning_rate=1e-5, epochs=1,
+              global_features=["load"], aug_perc=aug["aug_perc"], aug_seed=aug["aug_seed"])
+    if "anchors" in cfg:                                       # written by scripts/train_anchor.py (Run B1)
+        mgn = AnchorMGN(anchors=cfg["anchors"], redraw=cfg["redraw"], **kw)
+    else:
+        mgn = AugMGN(**kw)
     mgn._train_fem = cases
     mgn._y_train = torch.tensor(y, dtype=torch.float).squeeze()
     fem_data = mgn._preprocess_fems(cases)
@@ -159,7 +168,8 @@ def load_model(a):
                  % (a.layers, a.hidden, str(exc).splitlines()[0]))
     mgn._model.eval()
     mgn._train_fem = None                     # free the training cases
-    desc = "best weights so far: epoch %s, training loss %.3e" % (epoch, loss)
+    desc = "best weights so far: epoch %s, training loss %.3e%s" % (
+        epoch, loss, ", Run B1 (anchors %s, re-drawn edges %s)" % (cfg["anchors"], cfg["redraw"]) if "anchors" in cfg else "")
     return mgn, desc, train_loads
 
 
@@ -471,6 +481,8 @@ def main():
                     help="'test' (default: the unseen test loads), 'all', or numbers, e.g. 5000")
     ap.add_argument("--no-contours", action="store_true")
     ap.add_argument("--units", default="psi")
+    ap.add_argument("--draws", type=int, default=1,
+                    help="average the prediction over this many random-edge draws (seeds aug_seed + 0..K-1)")
     ap.add_argument("--layers", type=int, default=20)
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--embedding", type=int, default=16)
@@ -478,7 +490,8 @@ def main():
 
     if not os.path.isfile(a.ckpt):
         sys.exit("No checkpoint at %s" % a.ckpt)
-    out = a.out or os.path.join(os.path.dirname(a.ckpt) or ".", "unseen_eval")
+    out = a.out or os.path.join(os.path.dirname(a.ckpt) or ".",
+                                "unseen_eval" + ("_draws%d" % a.draws if a.draws > 1 else ""))
     os.makedirs(out, exist_ok=True)
 
     sets = [("unseen_loads", a.loads_dir), ("unseen_interp", a.interp_dir), ("unseen_extrap", a.extrap_dir)]
@@ -507,8 +520,9 @@ def main():
 
     print("=" * 78)
     print("checkpoint   %s  ->  %s" % (a.ckpt, desc))
-    print("device       %s    edge augmentation %.0f%% (seed %d)"
-          % (mgn.device, 100 * mgn.aug_perc, mgn.aug_seed))
+    print("device       %s    edge augmentation %.0f%% (seed %d)%s"
+          % (mgn.device, 100 * mgn.aug_perc, mgn.aug_seed,
+             "   prediction = mean of %d random-edge draws" % a.draws if a.draws > 1 else ""))
     print("trained on   %s" % ", ".join("%g-%g" % b for b in bands) + " %s" % a.units)
     print("test loads   %s %s   (Fig. 3 style plot at %s)"
           % (", ".join("%g" % L for L in test_loads), a.units, "%g" % fig3_load if fig3_load else "-"))
@@ -521,18 +535,21 @@ def main():
     for key, _ in sets:
         cdir = os.path.join(out, "contours", key)
         for item in data[key]:
-            tk = (item["name"], len(item["coords"]))
-            if tk not in topo:
-                ei, nt, fl = build_topology(item["coords"], item["tris"], item["name"],
-                                            aug_perc=mgn.aug_perc, aug_seed=mgn.aug_seed)[:3]
-                topo[tk] = (ei, nt, fl)
-            ei, nt, fl = topo[tk]
-            item["node_types"] = nt
-            case = Case(geometry=item["name"], coordinates=item["coords"], edge_index=ei, node_types=nt,
-                        von_mises=np.zeros(len(item["coords"]), dtype=np.float32),
-                        metadata={"load": item["load"]}, edge_flag=fl)
-            with torch.no_grad():
-                pred = np.asarray(mgn.predict(case), dtype=np.float64).ravel()
+            preds = []
+            for k in range(max(1, a.draws)):
+                tk = (item["name"], len(item["coords"]), k)
+                if tk not in topo:
+                    ei, nt, fl = build_topology(item["coords"], item["tris"], item["name"],
+                                                aug_perc=mgn.aug_perc, aug_seed=mgn.aug_seed + k)[:3]
+                    topo[tk] = (ei, nt, fl)
+                ei, nt, fl = topo[tk]
+                item["node_types"] = nt
+                case = Case(geometry=item["name"], coordinates=item["coords"], edge_index=ei, node_types=nt,
+                            von_mises=np.zeros(len(item["coords"]), dtype=np.float32),
+                            metadata={"load": item["load"]}, edge_flag=fl)
+                with torch.no_grad():
+                    preds.append(np.asarray(mgn.predict(case), dtype=np.float64).ravel())
+            pred = np.mean(preds, axis=0)
             m = metrics(item["truth"], pred)
             rows.append(dict(set=key, geometry=item["name"], load=item["load"], n_nodes=len(pred),
                              **dict((k, v) for k, v in m.items() if not k.startswith("i_"))))

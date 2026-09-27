@@ -44,6 +44,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mgn.dataset import Case, build_topology                  # noqa: E402
 from mgn.augmented_trainer import AugMGN                      # noqa: E402
+from mgn.anchor_trainer import AnchorMGN                   # noqa: E402
+
+
+def load_model_any(path):
+    """Run B1 checkpoints (anchors / re-drawn edges) and all older ones."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    return AnchorMGN.load(path) if "b1" in ck else AugMGN.load(path)
 
 # paper order, labels and R2 (Fig. 3)
 PANELS = [
@@ -136,7 +143,7 @@ def main():
         print("No model at %s" % a.ckpt)
         return 1
 
-    mgn = AugMGN.load(a.ckpt)
+    mgn = load_model_any(a.ckpt)
     if a.out is None:
         a.out = os.path.join(os.path.dirname(a.ckpt) or ".", "fig3")
     os.makedirs(a.out, exist_ok=True)
